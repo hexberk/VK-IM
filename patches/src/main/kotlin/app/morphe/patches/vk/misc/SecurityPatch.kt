@@ -5,6 +5,8 @@ import app.morphe.patcher.extensions.InstructionExtensions.addInstructions
 import app.morphe.patcher.patch.bytecodePatch
 import app.morphe.patches.vk.shared.Constants.COMPATIBILITY_VK
 import app.morphe.patches.vk.shared.references
+import com.android.tools.smali.dexlib2.Opcode
+import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
 
 internal object AuthBridgeIllegalAccessFingerprint : Fingerprint(
     returnType = "V",
@@ -22,6 +24,18 @@ internal object HijackingAppsTaskFingerprint : Fingerprint(
     custom = { _, classDef -> classDef.sourceFile == "HijackingAppsTask.kt" },
     name = "invoke",
     returnType = "Ljava/lang/Object;",
+    parameters = emptyList()
+)
+
+// VK Messenger: ImApplication::checkHijackingApps reference. invoke() schedules the scan of installed apps
+// whose activities share the app's task affinity; the clone matches itself (non-VK signature) and posts
+// "Dangerous app found" through the generic push pipeline plus a non-fatal "Hijacking apps found" report
+internal object CheckHijackingAppsFingerprint : Fingerprint(
+    custom = { method, classDef ->
+        classDef.sourceFile == "ImApplication.kt" &&
+            method.name == "invoke" &&
+            classDef.methods.any { it.name == "<init>" && it.references("checkHijackingApps") }
+    },
     parameters = emptyList()
 )
 
@@ -94,6 +108,22 @@ val securityPatch = bytecodePatch(
                 0,
                 """
                     const/4 v0, 0x0
+                    return-object v0
+                """
+            )
+        }
+
+        // Disable the startup scan in VK Messenger: return the Unit that invoke() loads right before return-object
+        // Absent in VK: there the scan lives in HijackingAppsTask
+        CheckHijackingAppsFingerprint.methodOrNull?.apply {
+            val instructions = implementation!!.instructions.toList()
+            val unit = instructions.zipWithNext()
+                .last { (load, ret) -> load.opcode == Opcode.SGET_OBJECT && ret.opcode == Opcode.RETURN_OBJECT }
+                .let { (load, _) -> (load as ReferenceInstruction).reference }
+            addInstructions(
+                0,
+                """
+                    sget-object v0, $unit
                     return-object v0
                 """
             )
